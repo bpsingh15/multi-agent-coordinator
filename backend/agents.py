@@ -1,15 +1,17 @@
 import json
 from datetime import datetime, timezone
+from typing import Any, Optional, cast
+from pydantic import SecretStr
 from langchain_openai import ChatOpenAI
-from langchain.agents import AgentExecutor, create_openai_functions_agent
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.agents import create_agent
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from config import supabase, OPENAI_API_KEY
 
-llm = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY, temperature=0.7)
+llm = ChatOpenAI(model="gpt-4o-mini", api_key=SecretStr(OPENAI_API_KEY) if OPENAI_API_KEY else None, temperature=0.7)
 
 
-def log_activity(agent_id: str, task_id: str, action: str, message: str, metadata: dict = None):
+def log_activity(agent_id: str, task_id: str, action: str, message: str, metadata: Optional[dict] = None):
     """Log agent activity to Supabase for real-time display."""
     supabase.table("activity_log").insert({
         "agent_id": agent_id,
@@ -20,9 +22,9 @@ def log_activity(agent_id: str, task_id: str, action: str, message: str, metadat
     }).execute()
 
 
-def update_agent_status(agent_id: str, status: str, task_id: str = None):
+def update_agent_status(agent_id: str, status: str, task_id: Optional[str] = None):
     """Update an agent's status in the database."""
-    data = {
+    data: dict[str, Any] = {
         "status": status,
         "last_active": datetime.now(timezone.utc).isoformat(),
     }
@@ -33,9 +35,9 @@ def update_agent_status(agent_id: str, status: str, task_id: str = None):
     supabase.table("agents").update(data).eq("id", agent_id).execute()
 
 
-def update_task(task_id: str, status: str, result: str = None, assigned_agent_id: str = None):
+def update_task(task_id: str, status: str, result: Optional[str] = None, assigned_agent_id: Optional[str] = None):
     """Update a task's status and result."""
-    data = {
+    data: dict[str, Any] = {
         "status": status,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -92,16 +94,10 @@ Give a final verdict: APPROVED or NEEDS_REVISION with clear reasoning.""",
 }
 
 
-def create_agent_executor(role: str) -> AgentExecutor:
-    """Create a LangChain agent executor for a given role."""
+def create_agent_executor(role: str):
+    """Create a LangGraph agent for a given role."""
     config = AGENT_CONFIGS[role]
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", config["system_prompt"]),
-        ("human", "{input}"),
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
-    ])
-    agent = create_openai_functions_agent(llm, config["tools"], prompt)
-    return AgentExecutor(agent=agent, tools=config["tools"], verbose=True)
+    return create_agent(llm, config["tools"], system_prompt=config["system_prompt"])
 
 
 async def run_agent(agent_id: str, role: str, task_id: str, input_text: str) -> str:
@@ -113,8 +109,8 @@ async def run_agent(agent_id: str, role: str, task_id: str, input_text: str) -> 
 
     try:
         executor = create_agent_executor(role)
-        result = await executor.ainvoke({"input": input_text})
-        output = result["output"]
+        result = await executor.ainvoke({"messages": [HumanMessage(content=input_text)]})
+        output = result["messages"][-1].content
 
         log_activity(agent_id, task_id, "completed", f"{role.title()} agent finished work",
                      {"output_preview": output[:200]})
@@ -140,73 +136,90 @@ async def run_pipeline(topic: str):
     """
     # Fetch agents from DB
     agents_res = supabase.table("agents").select("*").execute()
-    agents = {a["role"]: a for a in agents_res.data}
+    if not agents_res.data:
+        raise ValueError("No agents found in database")
+    agents_data = cast(list[dict[str, Any]], agents_res.data)
+    agents = {a["role"]: a for a in agents_data}
+    for role in ("researcher", "writer", "reviewer"):
+        if role not in agents:
+            raise ValueError(f"Agent with role '{role}' not found in database")
 
     # Create the main task
-    main_task = supabase.table("tasks").insert({
+    main_task_res = supabase.table("tasks").insert({
         "title": f"Create content about: {topic}",
         "description": f"Full pipeline: research, write, and review content about {topic}",
         "status": "pending"
-    }).execute().data[0]
-    main_task_id = main_task["id"]
+    }).execute()
+    if not main_task_res.data:
+        raise ValueError("Failed to create main task")
+    main_task_id: str = str(cast(list[dict[str, Any]], main_task_res.data)[0]["id"])
 
     # --- Step 1: Research ---
-    research_task = supabase.table("tasks").insert({
+    research_task_res = supabase.table("tasks").insert({
         "title": f"Research: {topic}",
         "status": "pending",
         "parent_task_id": main_task_id
-    }).execute().data[0]
+    }).execute()
+    if not research_task_res.data:
+        raise ValueError("Failed to create research task")
+    research_task_id: str = str(cast(list[dict[str, Any]], research_task_res.data)[0]["id"])
 
-    log_activity(agents["researcher"]["id"], research_task["id"], "handoff",
+    log_activity(str(agents["researcher"]["id"]), research_task_id, "handoff",
                  "Task assigned to Researcher agent")
 
     research_result = await run_agent(
-        agents["researcher"]["id"],
+        str(agents["researcher"]["id"]),
         "researcher",
-        research_task["id"],
+        research_task_id,
         f"Research the following topic thoroughly and provide detailed findings: {topic}"
     )
-    update_task(research_task["id"], "completed", result=research_result)
+    update_task(research_task_id, "completed", result=research_result)
 
     # --- Step 2: Write (handoff from researcher) ---
-    write_task = supabase.table("tasks").insert({
+    write_task_res = supabase.table("tasks").insert({
         "title": f"Write: {topic}",
         "status": "pending",
         "parent_task_id": main_task_id
-    }).execute().data[0]
+    }).execute()
+    if not write_task_res.data:
+        raise ValueError("Failed to create write task")
+    write_task_id: str = str(cast(list[dict[str, Any]], write_task_res.data)[0]["id"])
 
-    log_activity(agents["researcher"]["id"], write_task["id"], "handoff",
+    log_activity(str(agents["researcher"]["id"]), write_task_id, "handoff",
                  "Researcher handing off to Writer agent")
-    log_activity(agents["writer"]["id"], write_task["id"], "handoff",
+    log_activity(str(agents["writer"]["id"]), write_task_id, "handoff",
                  "Writer agent receiving research findings")
 
     write_result = await run_agent(
-        agents["writer"]["id"],
+        str(agents["writer"]["id"]),
         "writer",
-        write_task["id"],
+        write_task_id,
         f"Based on the following research, write a polished article about {topic}:\n\n{research_result}"
     )
-    update_task(write_task["id"], "completed", result=write_result)
+    update_task(write_task_id, "completed", result=write_result)
 
     # --- Step 3: Review (handoff from writer) ---
-    review_task = supabase.table("tasks").insert({
+    review_task_res = supabase.table("tasks").insert({
         "title": f"Review: {topic}",
         "status": "pending",
         "parent_task_id": main_task_id
-    }).execute().data[0]
+    }).execute()
+    if not review_task_res.data:
+        raise ValueError("Failed to create review task")
+    review_task_id: str = str(cast(list[dict[str, Any]], review_task_res.data)[0]["id"])
 
-    log_activity(agents["writer"]["id"], review_task["id"], "handoff",
+    log_activity(str(agents["writer"]["id"]), review_task_id, "handoff",
                  "Writer handing off to Reviewer agent")
-    log_activity(agents["reviewer"]["id"], review_task["id"], "handoff",
+    log_activity(str(agents["reviewer"]["id"]), review_task_id, "handoff",
                  "Reviewer agent receiving content for review")
 
     review_result = await run_agent(
-        agents["reviewer"]["id"],
+        str(agents["reviewer"]["id"]),
         "reviewer",
-        review_task["id"],
+        review_task_id,
         f"Review the following article for quality, accuracy, and clarity:\n\n{write_result}"
     )
-    update_task(review_task["id"], "completed", result=review_result)
+    update_task(review_task_id, "completed", result=review_result)
 
     # Mark main task as completed
     final_result = {
